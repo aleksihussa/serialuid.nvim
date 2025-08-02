@@ -3,8 +3,9 @@
 
 local M = {}
 
-local function run_command(cmd)
-  local result = vim.fn.systemlist(cmd)
+local function run_command(cmd, cwd)
+  local opts = { cwd = cwd or nil }
+  local result = vim.fn.systemlist(cmd, opts.cwd)
   if vim.v.shell_error ~= 0 then
     return nil, table.concat(result, "\n")
   end
@@ -19,7 +20,7 @@ end
 
 local function get_maven_classpath(root)
   local cp_file = root .. "/classpath.txt"
-  local _, err = run_command("mvn -f " .. root .. "/pom.xml compile dependency:build-classpath -Dmdep.outputFile=classpath.txt")
+  local _, err = run_command("mvn -f pom.xml compile dependency:build-classpath -Dmdep.outputFile=classpath.txt", root)
   if err then
     print("Failed to build Maven classpath:\n" .. err)
     return nil
@@ -30,65 +31,35 @@ local function get_maven_classpath(root)
     print("Classpath file is empty.")
     return nil
   end
-  return lines[1] .. ":" .. root .. "/target/classes"
+  return root .. "/target/classes:" .. lines[1]
 end
 
 local function get_gradle_classpath(root)
-  local build_cp_file = root .. "/classpath.txt"
-  local gradle_cmd = "cd " .. root .. " && ./gradlew -q printClasspath > classpath.txt"
-  -- First, try if there's a printClasspath task (user needs to define it in build.gradle)
-  local _, err = run_command(gradle_cmd)
-  if err then
-    print("Trying fallback Gradle classpath (build/classes/java/main)...")
-    if vim.fn.isdirectory(root .. "/build/classes/java/main") == 1 then
-      return root .. "/build/classes/java/main"
-    else
-      print("Gradle build/classes not found.")
-      return nil
-    end
+  if vim.fn.isdirectory(root .. "/build/classes/java/main") == 1 then
+    return root .. "/build/classes/java/main"
   end
-  local lines = vim.fn.readfile(build_cp_file)
-  vim.fn.delete(build_cp_file)
-  if #lines == 0 then
-    print("Classpath file is empty.")
-    return nil
-  end
-  return lines[1] .. ":" .. root .. "/build/classes/java/main"
+  return nil
 end
 
-local function get_fqcn_and_classpath(filepath, content)
+local function extract_fqcn_and_paths(filepath)
   local parts = vim.split(filepath, "/")
-  local java_index = nil
+  local java_dir_index = nil
   for i, part in ipairs(parts) do
     if part == "java" then
-      java_index = i
+      java_dir_index = i
       break
     end
   end
-  if not java_index or java_index >= #parts then return nil, nil end
+  if not java_dir_index then return nil, nil, nil end
 
-  local root = table.concat(vim.list_slice(parts, 1, java_index - 2), "/")
-  local build_tool = detect_build_tool(root)
-  local classpath = nil
+  local src_path = table.concat(vim.list_slice(parts, 1, java_dir_index), "/")
+  local package_parts = vim.list_slice(parts, java_dir_index + 1)
+  local class_file = package_parts[#package_parts]
+  package_parts[#package_parts] = class_file:gsub(".java$", "")
+  local fqcn = table.concat(package_parts, ".")
+  local class_file_path = table.concat(package_parts, "/") .. ".java"
 
-  if build_tool == "maven" then
-    classpath = get_maven_classpath(root)
-  elseif build_tool == "gradle" then
-    -- Try user-defined task, else fallback
-    classpath = get_gradle_classpath(root)
-  end
-
-  local class_parts = vim.list_slice(parts, java_index + 1)
-  local class_file = class_parts[#class_parts]
-  class_parts[#class_parts] = class_file:gsub(".java$", "")
-  local declared_pkg = content:match("package%s+([%w%._]+)%s*;")
-  local fqcn = declared_pkg and (declared_pkg .. "." .. class_parts[#class_parts]) or table.concat(class_parts, ".")
-
-  return fqcn, classpath
-end
-
-local function get_package(content)
-  return content:match("package%s+([%w%._]+)%s*;")
+  return fqcn, class_file_path, src_path
 end
 
 function M.generate()
@@ -98,24 +69,55 @@ function M.generate()
     return
   end
 
-  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-  local content = table.concat(lines, "\n")
+  local fqcn, class_file_path, src_path = extract_fqcn_and_paths(bufname)
+  if not fqcn then
+    print("Could not resolve fully qualified class name.")
+    return
+  end
 
-  local fqcn, classpath = get_fqcn_and_classpath(bufname, content)
-  if fqcn and classpath then
-    local serialver_cmd = "serialver -classpath " .. vim.fn.shellescape(classpath) .. " " .. fqcn
+  local project_root = vim.fn.getcwd()
+  local build_tool = detect_build_tool(project_root)
+  local classpath = nil
+
+  if build_tool == "maven" then
+    classpath = get_maven_classpath(project_root)
+  elseif build_tool == "gradle" then
+    classpath = get_gradle_classpath(project_root)
+  end
+
+  local serialver_cmd = nil
+  if classpath then
+    serialver_cmd = "serialver -classpath " .. vim.fn.shellescape(classpath) .. " " .. fqcn
     local output, serr = run_command(serialver_cmd)
     if serr then
       print("serialver failed (project-aware):\n" .. serr)
     else
-      M.insert_uid(lines, output)
+      M.insert_uid(output)
+      return
     end
-  else
-    print("Could not resolve project classpath. Falling back to isolated compile is disabled for dependency-heavy classes.")
   end
+
+  -- VSCode-style fallback
+  print("Falling back to isolated javac compile...")
+  local javac_cmd = "javac " .. vim.fn.fnameescape(class_file_path)
+  local _, err = run_command(javac_cmd, src_path)
+  if err then
+    print("Compilation failed (isolated):\n" .. err)
+    return
+  end
+
+  serialver_cmd = "serialver " .. fqcn
+  local output, serr = run_command(serialver_cmd, src_path)
+  if serr then
+    print("serialver failed (fallback):\n" .. serr)
+    return
+  end
+
+  M.insert_uid(output)
 end
 
-function M.insert_uid(lines, output)
+function M.insert_uid(output)
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
   local uid = output[1] and output[1]:match("serialVersionUID%s*=%s*(%d+)L;")
   if not uid then
     print("Could not parse UID.")
